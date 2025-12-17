@@ -1,0 +1,222 @@
+# Refactoring Guide: Fix ipyaggrid Flickering in Solara Chat
+
+## Problem
+Tables flicker when new messages arrive and columns collapse when expanding to dialog.
+
+## Current Architecture
+```
+ChatBot Component (manages messages list, uses thread)
+    └── render_message()
+            └── MemoizedComponent (datagrid_display.py)
+                    └── setupDataGrid
+```
+
+## Root Cause
+ipyaggrid's `grid_data` and `grid_options` are NOT reactive traits. Reacton/Solara cannot auto-update them. You must use `solara.get_widget(el)` inside `use_effect` to update the widget imperatively.
+
+---
+
+## Required Changes
+
+### 1. Replace MemoizedComponent in `datagrid_display.py`
+
+```python
+import ipyaggrid
+import solara
+from typing import cast, List, Optional
+
+AGGRID_LICENSE_KEY = "community"
+
+
+def build_grid_options(
+    df,
+    date_columns: Optional[List[str]] = None,
+    hidden_columns: Optional[List[str]] = None,
+) -> dict:
+    """Build ag-grid columnDefs from DataFrame. Called once via use_memo."""
+    date_columns = date_columns or []
+    hidden_columns = hidden_columns or []
+    
+    column_defs = []
+    for col in df.columns:
+        col_def = {
+            "field": col,
+            "filter": True,
+            "sortable": True,
+            "resizable": True,
+            "minWidth": 100,
+        }
+        if col in hidden_columns:
+            col_def["hide"] = True
+        if col in date_columns:
+            col_def["filter"] = "agDateColumnFilter"
+        column_defs.append(col_def)
+    
+    return {
+        "columnDefs": column_defs,
+        "defaultColDef": {
+            "sortable": True,
+            "filter": True,
+            "resizable": True,
+            "minWidth": 100,
+        },
+        "animateRows": True,
+    }
+
+
+@solara.component
+def MemoizedDataGrid(
+    message_id: str,
+    df,
+    display_height: str = "400px",
+    date_columns: Optional[List[str]] = None,
+    hidden_columns: Optional[List[str]] = None,
+):
+    """
+    Stable ipyaggrid component with expand functionality.
+    
+    Key patterns applied:
+    - Element created once, updated imperatively via use_effect
+    - solara.get_widget() called ONLY inside use_effect
+    - columns_fit handles auto-sizing (js_post_grid is constructor-only, not settable)
+    - Widget displayed in ONE location at a time (inline XOR dialog)
+    """
+    
+    expanded = solara.use_reactive(False)
+    current_height = "80vh" if expanded.value else display_height
+    
+    # Compute grid options ONCE per component lifetime
+    grid_options = solara.use_memo(
+        lambda: build_grid_options(df, date_columns, hidden_columns),
+        dependencies=[]  # Empty = compute once, never recompute
+    )
+    
+    def update_grid():
+        """
+        Imperative widget update - REQUIRED for ipyaggrid.
+        grid_data and grid_options are not traits, so Reacton cannot update them.
+        """
+        widget = cast(ipyaggrid.Grid, solara.get_widget(el))
+        widget.grid_options = grid_options
+        widget.update_grid_data(df)
+        # Height must be set AFTER update_grid_data (which resets it)
+        widget.height = current_height
+    
+    # Create element with constructor params
+    # Note: columns_fit handles sizing; js_post_grid cannot be set imperatively
+    el = ipyaggrid.Grid.element(
+        grid_data=df,
+        grid_options=grid_options,
+        height=current_height,
+        columns_fit="size_to_fit",  # 'size_to_fit' | 'auto' | ''
+        license=AGGRID_LICENSE_KEY,
+    )
+    
+    # Run on mount and when expanded changes
+    solara.use_effect(update_grid, dependencies=[expanded.value])
+    
+    # UI
+    with solara.Column():
+        with solara.Row(justify="end"):
+            solara.Button(
+                icon_name="mdi-arrow-expand-all" if not expanded.value else "mdi-arrow-collapse-all",
+                on_click=lambda: expanded.set(not expanded.value),
+                icon=True,
+                text=True,
+            )
+        
+        # Display in ONE location only (widget can't exist in multiple DOM locations)
+        if not expanded.value:
+            solara.display(el)
+        
+        with solara.lab.ConfirmationDialog(
+            open=expanded.value,
+            on_close=lambda: expanded.set(False),
+            ok=None,
+            cancel="Close",
+            title="Expanded Data View",
+            max_width="95vw",
+        ):
+            if expanded.value:
+                solara.display(el)
+```
+
+### 2. Update render_message()
+
+Ensure each message has a stable `id` and call the new component:
+
+```python
+def render_message(message: dict):
+    # ... existing rendering logic ...
+    
+    if message.get("dataframe") is not None:
+        MemoizedDataGrid(
+            message_id=message["id"],  # Must be stable, generated at message creation
+            df=message["dataframe"],
+            display_height=message.get("display_height", "400px"),
+            date_columns=message.get("date_columns"),
+            hidden_columns=message.get("hidden_columns"),
+        )
+```
+
+### 3. Ensure Message IDs Exist
+
+In ChatBot, when creating messages:
+
+```python
+import uuid
+
+assistant_message = {
+    "id": str(uuid.uuid4()),  # Generate once at creation, never changes
+    "role": "assistant",
+    "dataframe": result_df,
+    # ... other fields
+}
+```
+
+---
+
+## What NOT To Do
+
+| Anti-Pattern | Why |
+|--------------|-----|
+| `widget.js_post_grid = "..."` | Constructor param only, not settable on widget |
+| `dependencies=[id(df)]` | `id()` changes every render even if data unchanged |
+| `dependencies=[df]` | DataFrames lack stable equality comparison |
+| `solara.get_widget()` outside use_effect | Only works inside use_effect callback |
+| Displaying same element in two places simultaneously | Widget can only exist in one DOM location |
+
+---
+
+## API Reference
+
+**solara.use_effect(fn, dependencies)**
+- `dependencies=[]` → Run once on mount
+- `dependencies=[var]` → Re-run when var changes
+
+**solara.use_memo(fn, dependencies)**
+- `dependencies=[]` → Compute once per component lifetime
+
+**solara.get_widget(el)**
+- Returns underlying ipywidget
+- ONLY callable inside use_effect
+
+**ipyaggrid widget methods (inside use_effect)**
+- `widget.grid_options = {...}` → Update options
+- `widget.update_grid_data(df)` → Update data (resets height)
+- `widget.height = "..."` → Set height (call AFTER update_grid_data)
+
+**ipyaggrid.Grid.element() params**
+- `columns_fit`: `'size_to_fit'` (fill space) | `'auto'` (fit content) | `''` (manual)
+- `js_post_grid`: List of JS strings, constructor-only
+
+---
+
+## Verification
+
+| Test | Expected |
+|------|----------|
+| Send new message | Existing tables don't flicker |
+| Click expand | Grid moves to dialog, columns retain width |
+| Close dialog | Grid returns inline with state preserved |
+| Multiple tables | Each independent, no cross-contamination |
